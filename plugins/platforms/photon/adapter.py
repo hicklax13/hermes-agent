@@ -84,6 +84,12 @@ _DEDUP_MAX_SIZE = 4000
 _DEDUP_WINDOW_SECONDS = 48 * 3600
 
 _SIDECAR_DIR = Path(__file__).parent / "sidecar"
+_SIDECAR_ENTRY = _SIDECAR_DIR / "index.mjs"
+# Self-heal: a snapshot of the last index.mjs that booted to a healthy /healthz.
+# If a future edit (or a bad `npm`) leaves the sidecar unable to start, the
+# adapter rolls back to this copy so the iMessage channel can never be silently
+# bricked by a non-booting entrypoint.
+_SIDECAR_KNOWN_GOOD = _SIDECAR_DIR / "index.mjs.known-good"
 
 # Photon / Envoy / spectrum-ts error substrings that indicate a transient
 # upstream overload rather than a permanent failure.  These are not in the
@@ -357,6 +363,7 @@ class PhotonAdapter(BasePlatformAdapter):
         if self._autostart_sidecar:
             try:
                 await self._start_sidecar()
+                self._snapshot_known_good()
             except Exception as e:
                 self._set_fatal_error(
                     "SIDECAR_FAILED",
@@ -865,6 +872,32 @@ class PhotonAdapter(BasePlatformAdapter):
                 exc,
             )
 
+        try:
+            await self._spawn_sidecar_and_wait(env)
+        except Exception as first_err:
+            # A sidecar that won't even boot — e.g. a corrupted or self-edited
+            # index.mjs with an unresolvable import — bricks iMessage in BOTH
+            # directions. If we have a snapshot of the last index.mjs that booted
+            # to a healthy /healthz, roll back to it and retry once so the channel
+            # self-heals instead of staying dark until someone notices.
+            if self._restore_known_good_if_broken():
+                logger.error(
+                    "[photon] sidecar failed to start (%s) — restored "
+                    "last-known-good index.mjs and retrying once",
+                    first_err,
+                )
+                await self._reap_stale_sidecar()
+                await self._spawn_sidecar_and_wait(env)
+            else:
+                raise
+
+    async def _spawn_sidecar_and_wait(self, env: dict) -> None:
+        """Spawn the sidecar process and block until its /healthz is ready.
+
+        Raises if the process dies or never becomes ready within 15s. Factored
+        out of _start_sidecar so the caller can retry it after a known-good
+        rollback.
+        """
         self._sidecar_proc = subprocess.Popen(  # noqa: S603
             [self._node_bin, str(_SIDECAR_DIR / "index.mjs")],
             stdin=subprocess.PIPE,
@@ -903,6 +936,50 @@ class PhotonAdapter(BasePlatformAdapter):
         raise RuntimeError(
             f"Photon sidecar did not become ready within 15s: {last_err}"
         )
+
+    def _restore_known_good_if_broken(self) -> bool:
+        """If a known-good index.mjs snapshot exists and differs from the live
+        file, restore it (saving the broken copy for forensics). Returns True
+        only when it actually rolled the file back — i.e. when the live file is
+        the likely cause. A transient failure (rate-limit, cloud outage) leaves
+        the file byte-identical to known-good, so this is a no-op and the caller
+        re-raises instead of masking the real problem.
+        """
+        try:
+            if not _SIDECAR_KNOWN_GOOD.exists():
+                return False
+            good = _SIDECAR_KNOWN_GOOD.read_bytes()
+            live = _SIDECAR_ENTRY.read_bytes() if _SIDECAR_ENTRY.exists() else b""
+            if good == live:
+                return False  # the entrypoint file is not what's broken
+            try:
+                (_SIDECAR_DIR / "index.mjs.broken-last").write_bytes(live)
+            except Exception:
+                pass
+            _SIDECAR_ENTRY.write_bytes(good)
+            logger.warning(
+                "[photon] live sidecar index.mjs could not start; rolled back to "
+                "last-known-good (broken copy saved as index.mjs.broken-last)"
+            )
+            return True
+        except Exception as e:
+            logger.warning("[photon] known-good rollback failed: %s", e)
+            return False
+
+    def _snapshot_known_good(self) -> None:
+        """Record the current index.mjs as the known-good snapshot once it has
+        booted to a healthy /healthz. This auto-tracks legitimate updates — a new
+        file becomes known-good as soon as it proves it can start — while still
+        protecting against an edit that won't boot at all.
+        """
+        try:
+            live = _SIDECAR_ENTRY.read_bytes()
+            if _SIDECAR_KNOWN_GOOD.exists() and _SIDECAR_KNOWN_GOOD.read_bytes() == live:
+                return
+            _SIDECAR_KNOWN_GOOD.write_bytes(live)
+            logger.info("[photon] snapshotted healthy sidecar index.mjs as known-good")
+        except Exception as e:
+            logger.debug("[photon] known-good snapshot failed: %s", e)
 
     async def _supervise_sidecar(self, proc: subprocess.Popen) -> None:
         """Pump the sidecar's stdout/stderr into our logger."""

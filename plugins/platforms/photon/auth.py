@@ -153,16 +153,32 @@ def load_project_credentials() -> Tuple[Optional[str], Optional[str]]:
     """
     env_id = os.getenv("PHOTON_PROJECT_ID")
     env_sec = os.getenv("PHOTON_PROJECT_SECRET")
-    if env_id and env_sec:
-        return env_id, env_sec
     auth = _load_auth()
     proj = auth.get("credential_pool", {}).get("photon_project") or []
-    if isinstance(proj, list) and proj:
-        entry = proj[0]
-        # back-compat: old records used "project_id" for the spectrum id
-        sid = entry.get("spectrum_project_id") or entry.get("project_id")
-        return (env_id or sid, env_sec or entry.get("project_secret"))
-    return env_id, env_sec
+    entry = proj[0] if isinstance(proj, list) and proj else {}
+    # back-compat: old records used "project_id" for the spectrum id
+    auth_id = entry.get("spectrum_project_id") or entry.get("project_id")
+    auth_sec = entry.get("project_secret")
+
+    # Guard against a truncated/corrupted .env secret silently shadowing the
+    # authoritative provisioned one. A 13-char prefix of the real 43-char secret
+    # once bricked iMessage with a 401 for days: env "wins" here, so the bad
+    # value was never overridden. If the env secret is a strict prefix (i.e. a
+    # truncation) of the auth.json secret for this project, trust auth.json and
+    # shout — a legitimately rotated secret is a *different* string, not a prefix,
+    # so this never overrides an intentional override.
+    if env_sec and auth_sec and env_sec != auth_sec and auth_sec.startswith(env_sec):
+        logger.warning(
+            "[photon] PHOTON_PROJECT_SECRET in the environment looks truncated "
+            "(%d chars) versus the provisioned secret in auth.json (%d chars); "
+            "using the auth.json secret. Fix .env or re-run `hermes photon setup`.",
+            len(env_sec), len(auth_sec),
+        )
+        env_sec = auth_sec
+
+    if env_id and env_sec:
+        return env_id, env_sec
+    return (env_id or auth_id, env_sec or auth_sec)
 
 
 def load_dashboard_project_id() -> Optional[str]:
